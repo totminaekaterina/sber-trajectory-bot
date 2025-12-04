@@ -9,7 +9,7 @@ COPY package*.json ./
 RUN npm install --production
 
 # Копируем код backend
-COPY ..
+COPY . .
 
 # Render устанавливает PORT автоматически
 EXPOSE 8000
