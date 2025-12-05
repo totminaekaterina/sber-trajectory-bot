@@ -9,7 +9,7 @@ if (tg.colorScheme === 'dark') {
 }
 
 // Конфигурация
-const API_URL = 'http://localhost:8000/data'; // Замените на ваш backend URL
+const API_URL = 'https://sber-trajectory-bot.onrender.com'; // Замените на ваш backend URL
 const QUIZ_TIME = 15 * 60; // 15 минут в секундах
 
 // Состояние приложения
