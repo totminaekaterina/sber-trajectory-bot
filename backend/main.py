@@ -6,30 +6,60 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+import gspread  # ← ДОБАВИТЬ
+from oauth2client.service_account import ServiceAccountCredentials  # ← ДОБАВИТЬ
+
 
 app = FastAPI(title="Sber Quiz API")
+
 
 # CORS для работы с Telegram Mini App
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В production указать конкретные домены
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # Пути к файлам данных
 DATA_DIR = Path("data")
 QUESTIONS_FILE = DATA_DIR / "questions.json"
-RESULTS_FILE = DATA_DIR / "users_results.json"
 
 # Создаем директорию если не существует
 DATA_DIR.mkdir(exist_ok=True)
 
-# Инициализация пустого файла результатов
-if not RESULTS_FILE.exists():
-    with open(RESULTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump({}, f)
+
+# Настройка Google Sheets
+SCOPE = [
+    'https://spreadsheets.google.com/feeds',
+    'https://www.googleapis.com/auth/drive'
+]
+
+CREDENTIALS = json.loads(os.environ.get('GOOGLE_CREDENTIALS', '{}'))
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
+
+
+def get_sheet():
+    """Получить доступ к Google Таблице"""
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(CREDENTIALS, SCOPE)
+    client = gspread.authorize(creds)
+    return client.open_by_key(SPREADSHEET_ID).sheet1
+
+
+def init_sheet():
+    """Инициализировать заголовки таблицы"""
+    try:
+        sheet = get_sheet()
+        if not sheet.row_values(1):
+            headers = [
+                'User ID', 'Username', 'Score', 'Time Spent (sec)', 
+                'Timestamp', 'Answers', 'Questions'
+            ]
+            sheet.append_row(headers)
+    except Exception as e:
+        print(f"Ошибка инициализации таблицы: {e}")
 
 
 # Модели данных
@@ -61,40 +91,20 @@ def load_questions() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Questions file not found")
 
 
-def load_results() -> Dict[str, Any]:
-    """Загрузить результаты пользователей"""
-    try:
-        with open(RESULTS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-
-def save_results(results: Dict[str, Any]):
-    """Сохранить результаты в файл"""
-    with open(RESULTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-
-
-def calculate_score(answers: List[int], questions: List[int], all_questions: Dict) -> int:
+def calculate_score(answers: List[int], questions: List[int], all_questions: Dict) -> int:  # ← ИСПРАВЛЕНО
     """Подсчитать баллы пользователя"""
     score = 0
-
-    # Объединяем все вопросы в один список
     all_qs = []
     for category in ['statistics', 'probability', 'ml']:
-        all_qs.extend(all_questions[category])
-
-    # Создаем словарь id -> вопрос для быстрого поиска
+        all_qs.extend(all_questions[category])  # ← ИСПРАВЛЕНО (было QUESTIONS_FILE)
+    
     questions_dict = {q['id']: q for q in all_qs}
-
-    # Проверяем каждый ответ
+    
     for i, question_id in enumerate(questions):
         if i < len(answers):
             question = questions_dict.get(question_id)
             if question and answers[i] == question['correct']:
                 score += 1
-
     return score
 
 
@@ -104,7 +114,8 @@ def calculate_score(answers: List[int], questions: List[int], all_questions: Dic
 async def root():
     return {
         "message": "Sber Quiz API",
-        "version": "1.0.0",
+        "version": "2.0.0",  # ← Обновлено
+        "storage": "Google Sheets",
         "endpoints": ["/questions", "/check-user/{user_id}", "/submit", "/admin/results"]
     }
 
@@ -112,122 +123,126 @@ async def root():
 @app.get("/questions")
 async def get_questions():
     """Получить все вопросы (без правильных ответов)"""
-    questions = load_questions()
-
-    # Удаляем правильные ответы для безопасности
+    questions = load_questions()  # ← ИСПРАВЛЕНО (было QUESTIONS_FILE)
     clean_questions = {}
     for category, qs in questions.items():
         clean_questions[category] = [
             {k: v for k, v in q.items() if k != 'correct'}
             for q in qs
         ]
-
     return clean_questions
 
 
 @app.get("/check-user/{user_id}")
 async def check_user(user_id: str):
     """Проверить, проходил ли пользователь тест"""
-    results = load_results()
-
-    if user_id in results:
-        return {
-            "completed": True,
-            "timestamp": results[user_id]["timestamp"]
-        }
-
-    return {"completed": False}
+    try:
+        sheet = get_sheet()
+        user_ids = sheet.col_values(1)[1:]  # Пропускаем заголовок
+        
+        if user_id in user_ids:
+            return {"completed": True}
+        return {"completed": False}
+    except Exception as e:
+        print(f"Ошибка проверки пользователя: {e}")
+        return {"completed": False}
 
 
 @app.post("/submit")
 async def submit_quiz(data: SubmitRequest):
-    """Сохранить результаты теста"""
-    results = load_results()
-    user_id = str(data.telegram_user_id)
-
-    # Проверяем, не проходил ли пользователь тест ранее
-    if user_id in results:
-        raise HTTPException(
-            status_code=400,
-            detail="User has already completed the quiz"
-        )
-
-    # Загружаем вопросы для подсчета баллов
-    questions = load_questions()
-    score = calculate_score(data.answers, data.questions, questions)
-
-    # Сохраняем результат
-    results[user_id] = {
-        "username": data.username,
-        "completed": True,
-        "timestamp": datetime.now().isoformat(),
-        "answers": data.answers,
-        "questions": data.questions,
-        "time_spent": data.time_spent,
-        "score": score
-    }
-
-    save_results(results)
-
-    return {
-        "success": True,
-        "message": "Quiz results saved successfully"
-    }
+    """Сохранить результаты теста в Google Sheets"""
+    try:
+        sheet = get_sheet()
+        user_id = str(data.telegram_user_id)
+        
+        # Проверяем, не проходил ли тест
+        user_ids = sheet.col_values(1)[1:]
+        if user_id in user_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="User has already completed the quiz"
+            )
+        
+        # Загружаем вопросы и подсчитываем баллы
+        questions = load_questions()  # ← ДОБАВЛЕНО
+        score = calculate_score(data.answers, data.questions, questions)  # ← ИСПРАВЛЕНО
+        
+        # Добавляем строку в таблицу
+        row = [
+            user_id,
+            data.username,
+            score,
+            data.time_spent,
+            datetime.now().isoformat(),
+            str(data.answers),
+            str(data.questions)
+        ]
+        
+        sheet.append_row(row)
+        
+        return {
+            "success": True,
+            "message": "Results saved to Google Sheets",
+            "score": score
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Ошибка сохранения: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/results")
 async def get_all_results():
-    """Получить все результаты (для преподавателя)"""
-    # TODO: Добавить аутентификацию для защиты этого endpoint
-    results = load_results()
-
-    # Сортируем по баллам
-    sorted_results = sorted(
-        results.items(),
-        key=lambda x: x[1]['score'],
-        reverse=True
-    )
-
-    return {
-        "total_users": len(results),
-        "results": [
-            {
-                "user_id": user_id,
-                "username": data['username'],
-                "score": data['score'],
-                "time_spent": data['time_spent'],
-                "timestamp": data['timestamp']
-            }
-            for user_id, data in sorted_results
-        ]
-    }
+    """Получить все результаты из Google Sheets"""
+    try:
+        sheet = get_sheet()
+        records = sheet.get_all_records()
+        
+        # Сортируем по баллам
+        sorted_records = sorted(records, key=lambda x: x.get('Score', 0), reverse=True)
+        
+        return {
+            "total_users": len(records),
+            "results": sorted_records
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/statistics")
 async def get_statistics():
-    """Получить статистику по ответам"""
-    results = load_results()
-    questions = load_questions()
+    """Получить статистику из Google Sheets"""  # ← ИСПРАВЛЕНО
+    try:
+        sheet = get_sheet()
+        records = sheet.get_all_records()
+        
+        if not records:
+            return {"message": "No results yet"}
+        
+        total_users = len(records)
+        total_score = sum(r.get('Score', 0) for r in records)
+        avg_score = total_score / total_users if total_users > 0 else 0
+        avg_time = sum(r.get('Time Spent (sec)', 0) for r in records) / total_users if total_users > 0 else 0
+        
+        return {
+            "total_users": total_users,
+            "average_score": round(avg_score, 2),
+            "average_time_seconds": round(avg_time, 2),
+            "max_score": 9,
+            "completion_rate": f"{(avg_score / 9 * 100):.1f}%"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    if not results:
-        return {"message": "No results yet"}
 
-    # Подсчет статистики
-    total_users = len(results)
-    total_score = sum(r['score'] for r in results.values())
-    avg_score = total_score / total_users if total_users > 0 else 0
-    avg_time = sum(r['time_spent'] for r in results.values()) / total_users if total_users > 0 else 0
-
-    return {
-        "total_users": total_users,
-        "average_score": round(avg_score, 2),
-        "average_time_seconds": round(avg_time, 2),
-        "max_score": 9,
-        "completion_rate": f"{(avg_score / 9 * 100):.1f}%"
-    }
+# Инициализация при старте
+@app.on_event("startup")
+async def startup_event():
+    init_sheet()
 
 
-# Запуск: uvicorn main:app --reload --host 0.0.0.0 --port 8000
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
